@@ -5,6 +5,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <FS.h>
+#include <SPIFFS.h>
 using namespace fs;
 #include <TFT_eSPI.h>
 #include <SPI.h>
@@ -119,10 +120,9 @@ static const ColorTheme COLOR_THEMES[] = {
   { "Cyan / Orange","#00e5ff", "#ff8000", 0x07FF, 0xFD00, 0x0862 },
   { "Amber",       "#ffff00", "#ff4400", 0xFFE0, 0xF880, 0x18C3 },
   { "Monochrome",  "#ffffff", "#424242", 0xFFFF, 0x4208, 0x0000 },
-  { "Neon",        "#00ff00", "#ff00ff", 0x07E0, 0xF81F, 0x0000 },
-  { "Navy",        "#00e5ff", "#ff6600", 0x07FF, 0xFB40, 0x0015 },
+  { "Neon",        "#00ff00", "#ff00ff", 0x07E0, 0xF81F, 0x000C },
 };
-static const int NUM_COLOR_THEMES = 6;
+static const int NUM_COLOR_THEMES = 5;
 int      g_themeIdx = 0;
 uint16_t g_cUp      = COLOR_THEMES[0].cUp;
 uint16_t g_cDown    = COLOR_THEMES[0].cDown;
@@ -213,10 +213,9 @@ const unsigned long TOUCH_DEBOUNCE    = 180UL;   // ms — lower = snappier swip
 static SemaphoreHandle_t    g_fetchSem  = nullptr;
 static volatile bool        g_fetchDone = false;
 
-// ─── Touch interrupt ─────────────────────────────────────────────────────────
-// GT911 INT pin drives low on each touch event. ISR sets flag; loop() reads it.
-static volatile bool g_touchPending = false;
-void IRAM_ATTR touchISR() { g_touchPending = true; }
+// ─── Touch polling ────────────────────────────────────────────────────────────
+// GT911 is polled every 16 ms in loop(). No ISR needed — the INT line on this
+// board does not reliably generate a FALLING edge after the reset sequence.
 
 // ─── Objects ─────────────────────────────────────────────────────────────────
 TFT_eSPI        tft;
@@ -276,6 +275,8 @@ void setup() {
   for (int p : {4, 16, 17, 2}) { pinMode(p, OUTPUT); digitalWrite(p, HIGH); }
 
   Serial.begin(115200);
+  delay(100);
+  Serial.println("\n\n=== TICKER BOOT ===");
 
   // Display init
   tft.init();
@@ -288,8 +289,7 @@ void setup() {
   tft.drawCentreString("Starting up...", SCREEN_W / 2, 168, 1);
 
   initGT911Touch();
-  // INT pin is now an input driven by GT911 — attach falling-edge interrupt
-  attachInterrupt(digitalPinToInterrupt(GT911_INT), touchISR, FALLING);
+  // INT pin left as INPUT; touch is polled in loop() — no ISR needed.
 
   // Load saved config (tz, color theme, auto-advance interval)
   {
@@ -306,6 +306,7 @@ void setup() {
     cfg.end();
   }
 
+  SPIFFS.begin(true); // mount filesystem (true = format if corrupt)
   loadPortfolio();
   loadWatchlist();
   loadCandleCache(); // pre-fill symbol cache from flash for instant first draw
@@ -412,10 +413,14 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  // Touch: GT911 INT fires ISR → flag checked here (I2C read only when needed)
-  if (g_touchPending) {
-    g_touchPending = false;
-    handleTouch();
+  // Touch: poll GT911 status register at ~60 Hz (one I2C read per 16 ms)
+  {
+    static unsigned long lastTouchPollMs = 0;
+    unsigned long now = millis();
+    if (now - lastTouchPollMs >= 16) {
+      lastTouchPollMs = now;
+      handleTouch();
+    }
   }
 
   // Periodic data refresh — skip when market is closed (no new data)
@@ -496,6 +501,7 @@ void switchSymbol(int newIdx) {
 void handleTouch() {
   int tx, ty;
   if (!readGT911Touch(tx, ty)) return;
+  if (g_watchlistLen == 0) return; // Ignore touch if no watchlist
   unsigned long now = millis();
   if (now - lastTouchMs < TOUCH_DEBOUNCE) return;
   lastTouchMs = now;
@@ -521,7 +527,7 @@ void initGT911Touch() {
   delay(10);
   digitalWrite(GT911_RST, HIGH);
   delay(60);
-  pinMode(GT911_INT, INPUT);
+  pinMode(GT911_INT, INPUT_PULLUP); // keep INT line from floating between polls
   delay(50);
 
   if (gt911Probe(0x5D)) {
@@ -1148,6 +1154,39 @@ void drawChart() {
       drawStars();
       drawClock(0, SCREEN_H, C_PANEL, session);
     }
+    // Nav dots — always draw so swipes have visible feedback during closed hours
+    {
+      int dotY  = SCREEN_H - UI_BAR_DOTY;
+      int total = g_watchlistLen + 1;
+      int dotsX = (SCREEN_W - total * UI_DOT_STEP) / 2;
+      for (int i = 0; i < total; i++) {
+        int dx = dotsX + i * UI_DOT_STEP + UI_DOT_STEP / 2;
+        bool active = (i == currentSymIdx);
+        if (i == g_watchlistLen) {
+          uint16_t col = active ? C_WHITE : C_DARKGRAY;
+          tft.fillRect(dx - 4, dotY - 4, 9, 9, col);
+        } else {
+          if (active) tft.fillCircle(dx, dotY, 5, C_WHITE);
+          else        tft.fillCircle(dx, dotY, 4, C_DARKGRAY);
+        }
+      }
+    }
+    return;
+  }
+
+  // Empty watchlist prompt
+  if (g_watchlistLen == 0) {
+    tft.fillScreen(C_BG);
+    tft.setTextColor(C_WHITE, C_BG);
+    tft.setTextSize(2);
+    tft.drawCentreString("No Watchlist", SCREEN_W / 2, 120, 2);
+    tft.setTextSize(1);
+    tft.setTextColor(C_GRAY, C_BG);
+    tft.drawCentreString("Open in browser:", SCREEN_W / 2, 160, 1);
+    tft.setTextColor(0xFD00, C_BG);  // orange
+    tft.drawCentreString("ticker.local", SCREEN_W / 2, 180, 2);
+    tft.setTextColor(C_GRAY, C_BG);
+    tft.drawCentreString("Add symbols in the Watchlist section", SCREEN_W / 2, 210, 1);
     return;
   }
 
@@ -1448,37 +1487,46 @@ void savePortfolio() {
 
 // ─── Watchlist flash storage ─────────────────────────────────────────────────
 void loadWatchlist() {
-  static const char* DEF[] = {"SPY","LLY","MU","MSFT","GOOG","NVDA"};
-  Preferences wl;
-  wl.begin("wlist", true);
-  int len = wl.getInt("len", 0);
-  if (len > 0 && len <= MAX_WATCHLIST) {
-    g_watchlistLen = len;
-    for (int i = 0; i < len; i++) {
-      char key[4]; snprintf(key, sizeof(key), "w%d", i);
-      String s = wl.getString(key, "");
-      strncpy(g_watchlist[i], s.c_str(), sizeof(g_watchlist[0]) - 1);
-      g_watchlist[i][sizeof(g_watchlist[0]) - 1] = '\0';
+  File f = SPIFFS.open("/watchlist.txt", "r");
+  if (f && f.size() > 0) {
+    String data = f.readString();
+    f.close();
+    int count = 0;
+    int pos = 0;
+    while (pos < data.length() && count < MAX_WATCHLIST) {
+      int nl = data.indexOf('\n', pos);
+      if (nl == -1) nl = data.length();
+      String sym = data.substring(pos, nl);
+      sym.trim();
+      if (sym.length() > 0) {
+        strncpy(g_watchlist[count], sym.c_str(), sizeof(g_watchlist[0]) - 1);
+        g_watchlist[count][sizeof(g_watchlist[0]) - 1] = '\0';
+        count++;
+      }
+      pos = nl + 1;
     }
+    g_watchlistLen = count;
+    Serial.printf("Loaded %d watchlist symbols from file\n", count);
   } else {
-    g_watchlistLen = 6;
-    for (int i = 0; i < 6; i++) {
-      strncpy(g_watchlist[i], DEF[i], sizeof(g_watchlist[0]) - 1);
-      g_watchlist[i][sizeof(g_watchlist[0]) - 1] = '\0';
-    }
+    if (f) f.close();
+    g_watchlistLen = 0;
+    Serial.println("No watchlist found — fresh device");
   }
-  wl.end();
 }
 
 void saveWatchlist() {
-  Preferences wl;
-  wl.begin("wlist", false);
-  wl.putInt("len", g_watchlistLen);
-  for (int i = 0; i < g_watchlistLen; i++) {
-    char key[4]; snprintf(key, sizeof(key), "w%d", i);
-    wl.putString(key, g_watchlist[i]);
+  File f = SPIFFS.open("/watchlist.txt", "w");
+  if (!f) {
+    Serial.println("Failed to open watchlist file for writing");
+    return;
   }
-  wl.end();
+  Serial.printf("Saving watchlist: %d symbols\n", g_watchlistLen);
+  for (int i = 0; i < g_watchlistLen; i++) {
+    f.println(g_watchlist[i]);
+    Serial.printf("  [%d] %s\n", i, g_watchlist[i]);
+  }
+  f.close();
+  Serial.printf("Watchlist saved to /watchlist.txt\n");
 }
 
 // ─── Candle flash cache ───────────────────────────────────────────────────────
@@ -1691,12 +1739,14 @@ String handlePortfolioSave(const String& body) {
 
   if (body.length() == 0) return "Empty body";
 
-  DynamicJsonDocument doc(6144);
+  DynamicJsonDocument doc(8192);  // Increased from 6144
   DeserializationError err = deserializeJson(doc, body);
   if (err) {
-    Serial.printf("JSON parse failed: %s\n", err.c_str());
+    Serial.printf("JSON parse failed: %s (error code: %d)\n", err.c_str(), err.code());
+    Serial.printf("Body length: %d, buffer capacity: 8192\n", body.length());
     return String("JSON error: ") + err.c_str();
   }
+  Serial.println("JSON parsed successfully");
 
   // UTC offset (optional — only sent from main web UI)
   if (doc.containsKey("tz")) {
@@ -1722,12 +1772,17 @@ String handlePortfolioSave(const String& body) {
                   portfolio[positionCount].symbol,
                   portfolio[positionCount].shares,
                   portfolio[positionCount].avgCost);
+    Serial.flush();
     positionCount++;
   }
+  Serial.println("About to save portfolio...");
+  Serial.flush();
   savePortfolio();
   Serial.printf("Saved %d positions\n", positionCount);
+  Serial.flush();
 
   // Watchlist (optional)
+  Serial.printf("JSON has watchlist key: %s\n", doc.containsKey("watchlist") ? "YES" : "NO");
   if (doc.containsKey("watchlist")) {
     JsonArray wl = doc["watchlist"].as<JsonArray>();
     int newLen = 0;
